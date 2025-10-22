@@ -1,0 +1,519 @@
+#!/bin/zsh
+#
+# This script optionally runs a child program in its own systemd-run --user scope, then suspends and resumes the scope subject to certain conditions; it can also move unrelated grandchildren out of the scope cgroup.
+# If --cgroup /sys/fs/cgroup/path/to/cgroup is specified, it instead manages that cgroup (regardless of its type, or even of whether it was created by systemd).
+#
+# * The scope is thawed if one of its member processes receives the input focus.
+# * For the first GRACETIME seconds, the scope is left running.
+# * The scope is frozen if it hasn't had the input focus for more than SUSPENDAFTER seconds (if SUSPENDAFTER is set).
+#   * The scope is not frozen while it has at least TRAFFICTHRESHOLD bytes/second of incoming or outgoing traffic in total, if TRAFFICTHRESHOLD is set. This requires the ability to run `sudo pktstat-bpf`, and relies on parsing that tool's output, so it could be fragile.
+#     * Traffic sampling time is currently hard-coded to be 2s..
+# * The scope is thawed for RESUMEFOR seconds every RESUMEEVERY seconds, if both are set.
+#   * If TRAFFICTHRESHOLD is set, it's checked before re-freezing.
+# * Before freezing the scope, the script enumerates the processes that are in it, and moves any whose name doesn't match PROCNAME (a regex) from the child scope to the script's own cgroup (TODO: perhaps support moving to a different cgroup).
+# * The script will exit if the controlled scope becomes empty.
+# * In addition to freezing the cgroup, the script can also nice and un-nice the cgroup members when the cgroup loses or gains focus (NICE_BG, NICE_FG). Increasing niceness is only possible up to "20-$(ulimit -e nice)", the "max nice" rlimit (see getrlimit(2)).
+#   * Note: without configuration in /etc/security/limits*, rlimit_nice will generally be 0, which means the lowest attainable nice value is 20. Setting either --nice_bg or --nice_fg in this situation without --sudo_nice will effectively set the nice value to 19, always.
+#   * If --sudo_nice is passed on the command line, the script will use `sudo renice` instead of `renice`.
+#
+# The parameters can be set and changed at runtime as follows:
+#
+# * inherited environment variables (can't be changed at runtime)
+# * command line switches like "--suspendafter" (can't be changed at runtime; take precedence over inherited envvars)
+# * CONFDIR/{suspendafter,trafficthreshold,resumefor,resumeevery,procname_regex,debug,verbose,loglevel} (if CONFDIR is set, these will be read at runtime and have the highest precedence)
+# * CONFDIR/loopdelay sets the number of 100th of a second to wait between main loop executions if there is no focus change; defaults to 100 (1 second).
+#   * Set it higher to economize on CPU usage, but suspend/resume time deltas will be less accurate.
+#   * It probably doesn't make sense to lower it much; sub-second accuracy isn't implemented.
+#   * Focus changes are picked up immediately anyway.
+#
+# -p/--property switches are passed to systemd-run unchanged and can be mixed in with regular arguments.
+# The script will only work correctly with unified (v2) cgroups.
+# Changing PROCNAME at runtime will only apply to future decisions; processes already moved out of the monitored cgroup won't be moved back even if their name matches the new PROCNAME regex.
+#
+# Limitations:
+#
+# * Remote X displays untested; may not work.
+# * If a GUI terminal process is removed from the monitored scope, but the processes running in it are not, those will be suspended, but never resumed due to the terminal receiving focus.
+# * If there is a high rate of focus changes, CPU usage can be higher than ideal.
+# * Pasting stuff copied from a suspended process doesn't work. Install a clipboard manager like copyq as a workaround.
+# * The renicing is inherently, unfixably racy, because the cgroup membership can change while the renice is in progress.
+#
+# Further ideas, currently unimplemented (TODO):
+#
+# * Limit resource usage (CPUWeight, CPUQuota, AllowedCPUs, IOWeight) when no member process of the scope has input focus, perhaps as an alternative to suspending. ionice could also be increased, but lowering it would need root. Same for switching to a different CPU scheduler (e.g. SCHED_IDLE).
+#   * Many resouce management settings are only available for services, not scopes. TODO: evaluate switching from --scope to a service unit.
+# * Add a mode where we don't start a child, just manage several existing cgroups, not just one, each with its own configuration. Yay for feeping creaturism! Would this be worth it? You can just run multiple instances of the script, one per cgroup.
+#
+# Copyright (c) 2025 András Korn; licensed under the GPLv3.
+
+zmodload zsh/datetime
+zmodload zsh/regex
+autoload -Uz zmathfunc
+zmathfunc
+
+function start_child() {	# sets child_cgroup_path
+	setopt no_bg_nice
+	local cgroup_path=""
+	[[ -n "$UNITNAME" ]] || UNITNAME=${@//\//-}-$$	# try to generate something, because we need it to be deterministic; but ideally it should be passed in with --unit
+	systemd-run --user --scope $systemd_run_args --slice-inherit --same-dir --collect --unit $UNITNAME $@ &
+	# Wait for scope unit to exist and not be empty
+	local TIMEOUT=5
+	while [[ $TIMEOUT -gt 0 ]] && [[ -z "$cgroup_path" ]]; do
+		cgroup_path=$(systemctl --user show -p ControlGroup "$UNITNAME.scope" | sed 's/ControlGroup=//')
+		sleep 0.1
+		((TIMEOUT--))
+	done
+	child_cgroup_path=${cgroup_path:+/sys/fs/cgroup/${cgroup_path#ControlGroup=}}
+}
+
+function log() { # Usage: log <level> <message>.
+	# Prints message into logfile (or stderr). TODO: support adding a timestamp.
+	# Depends on "$me" being set to the name of the script being executed.
+	local level=$1
+	local level_index=${LOG_LEVEL_NAMES[(ie)$level]}
+	shift   # $@ holds the message now
+	if ((${LOG_LEVEL_NAMES[(ie)$LOG_LEVEL]}>=level_index)); then    # is the message of high enough priority to be logged?
+		if [[ $[EPOCHSECONDS-0$logged_time[$@]] -gt 5 ]]; then  # minimal rate limiting; don't log the same message more than once in less than 5 seconds
+			if [[ -n "$LOGFILE" ]]; then
+				echo "${me}[$UNITNAME]: $level: $@" >>$LOGFILE
+			else
+				echo "${me}[$UNITNAME]: $level: $@" >&2
+			fi
+			logged_time[$@]=$EPOCHSECONDS
+		fi
+	fi
+	local k
+	[[ $#logged_time -gt 50 ]] && for k in ${(k)logged_time}; do	# purge old entries from logged_time; otherwise it would grow without bounds
+		[[ $[EPOCHSECONDS-logged_time[$k]] -gt 5 ]] && unset "logged_time[$k]"
+	done
+}
+
+function usage() {
+	echo "Usage: chillscope [options] [--] command [args]
+
+	Runs 'command' in a new systemd scope, suspending it when it doesn't have input focus in X.
+
+	Options:
+		--cgroup dir	Manage the processes in the given cgroup, without starting a child.
+				'command' and its args are ignored in this case.
+		--confdir dir	Specify configuration directory. Files in this directory
+				are periodically read and can be used to change settings.
+		--debug		Enable debug output (loglevel=debug, tracing).
+		--gracetime n	Don't suspend programs for this many seconds after initial start.
+		--help		Output this help text and exit.
+		--suspendafter n
+				Suspend the monitored scope after this many seconds without focus.
+		--trafficthreshold n
+				If no process from the monitored scope has focus, but traffic to
+				or from the processes in the scope cgroup is at least this many
+				bytes/s, don't suspend the scope. Requires root.
+		--unit str	The name of the scope to create (without the '.scope').
+		--verbose	Shorthand for '--loglevel info'.
+		--logfile	Where to log; can be e.g. ~/.xsession-errors. Default: stderr
+		--loglevel <emerg|alert|crit|err|warning|notice|info|debug>
+				Set log level. Default: err
+		--nice_bg	Nice value to set cgroup members to when no cgroup member has focus.
+		--nice_fg	Nice value to set cgroup members to when a cgroup member has focus.
+				(By default, no renicing is done.)
+		--procname r	A regular expression process names and command lines in the
+				monitored cgroup are matched against. Non-matching processes
+				are moved out of the cgroup, into the current one.
+				Default: '.' (any process)
+		--resumeevery n	When the cgroup has been frozen, give it a chance to run after it
+				has been frozen for this many seconds.
+		--resumefor n	When resumed due to --resumeevery, the scope cgroup is
+				suspended again after this amount of time. Traffic threshold
+				still applies.
+		-p|--property	Passed on to 'systemd-run'.
+		--sudo_nice	Use sudo(8) to invoke renice, if necessary (based on ulimit -e).
+		--		Anything after this is passed to 'systemd-run'.
+	
+	The first argument that is not a recognized option is assumed to be 'command' and will be
+	passed to 'systemd-run'.
+" | sed 's/^\t//'
+}
+
+function get_active_window_data() {     # obtains class, pid and command associated with currently focused window; saves these in global variables
+	focused_pid=0
+	focused_procname=""
+	[[ $window = 0x0 ]] && { log debug "get_active_window_data: no window has focus"; return } # No window has focus
+	if [[ -z $class[$window] ]] || [[ $[RANDOM%10] = 0 ]]; then     # eventual consistency -- re-obtain window class occasionally, but not always, to save a few fork()s
+		local tempclass=$(xprop -notype -id "$window" WM_CLASS)
+		tempclass=${${tempclass#*\"}%%\"*}      # xprop output looks like 'WM_CLASS = "Opera developer", "Opera developer"'; get the first quoted string to save some memory, and to make debug messages more readable
+		class[$window]=$tempclass       # primitive caching
+	fi
+#	myclass=$class[$window]
+	prev_focused_pid=$focused_pid
+	prev_focused_procname="${proccomm[$prev_focused_pid]}[$prev_focused_pid] (cmdline ${(qq)proccmdline[$prev_focused_pid]})"
+	focused_pid=$(get_window_pid)
+	match_pid_procname $focused_pid	# populates proccomm and proccmdline
+	focused_procname="${proccomm[$focused_pid]}[$focused_pid] (cmdline ${(qq)proccmdline[$focused_pid]})"
+}
+
+function get_window_pid() {
+	local pid
+	if [[ $window = 0x0 ]]; then    # $window is a window ID as supplied by xprop(1)
+		echo 0
+		return
+	elif [[ -z "$win_to_pid[$window]" ]] || [[ $[RANDOM%10] = 0 ]]; then    # eventual consistency -- re-validate win-pid mappings occasionally, but not always, to save a few fork()s
+		xprop -notype -id "$window" _NET_WM_PID | read crap crap pid
+		win_to_pid[$window]=$pid
+	fi
+	echo $win_to_pid[$window]
+	if [[ $[RANDOM%10] = 0 ]] && [[ $#win_to_pid -gt 500 ]]; then		# purge old PIDs from the hash occasionally, but even then only if the hash is large, because this is relatively expensive
+		local oldsize=$#win_to_pid
+		local -A winids
+		local k
+		winids=($(xwininfo -root -tree | grep -o '0x[0-9a-fA-F]* [^[:space:]]'))	# include one character of the text following the window ID to use as a (never-used) value in the winids hash
+		for k in ${(k)win_to_pid}; do
+			(( ${+winids[$k]} )) || unset "win_to_pid[$k]"
+		done
+		log debug "get_window_pid: purging win_to_pid keys. Hash size $oldsize -> $#win_to_pid."
+	fi
+}
+
+function match_pid_procname() {    # returns true if EITHER /proc/$1/comm OR /proc/$1/cmdline (or both) match the PROCNAME regex
+	{ [[ -z "$1" ]] || [[ "$1" = 0 ]] } && { echo ""; return }	# sanity check
+	if [[ -f /proc/$1/comm ]]; then
+		proccomm[$1]="$(</proc/$1/comm)"
+		proccmdline[$1]="$(</proc/$1/cmdline)"
+	else	# no such process, or we can't access its /proc entry
+		unset "proccomm[$1]"
+		unset "proccmdline[$1]"
+	fi
+	if [[ $[RANDOM%10] = 0 ]] && [[ $#proccomm -gt 100 ]]; then		# purge old PIDs from the hash occasionally
+		local k
+		for k in ${(k)proccomm}; do
+			[[ -d /proc/$k ]] || unset "proccomm[$k]" "proccmdline[$k]"
+		done
+	fi
+	[[ -n "$proccomm[$1]" ]] || return 0 # avoid side effects of race conditions where /proc/$1/comm is empty when we read it (maybe the process was just exiting, or is just being spawned -- either way, we don't want to evict it from our cgroup)
+	[[ $proccomm[$1] =~ $PROCNAME ]] && return 0
+	[[ $proccmdline[$1] =~ $PROCNAME ]] && return 0
+	return 1
+}
+
+function get_controlled_pids() {
+	controlled_pids=($(<$child_cgroup_path/cgroup.procs)) || controlled_pids=()
+}
+
+function get_cgroup_path() {
+	local cgroup_path=$(</proc/$1/cgroup)
+	echo /sys/fs/cgroup/${cgroup_path#0::}	# this is where we depend on cgroupv2; in v1, /proc/self/cgroup may contain multiple lines
+}
+
+function remove_nonmatching_pids() {
+	local pid
+	local changed=0
+	my_cgroup_path=$(get_cgroup_path $$) # sets global my_cgroup_path
+	get_controlled_pids
+	for pid in $controlled_pids; do
+		if ! match_pid_procname $pid; then	
+			log notice "Process $pid, called $proccomm[$pid] (cmdline ${(qq)proccmdline[$pid]}) doesn't match regex ${(qq)PROCNAME}; moving to $my_cgroup_path"
+			echo $pid >$my_cgroup_path/cgroup.procs
+			[[ -n "$NICE_FG" ]] && $renice_cmd $NICE_FG $pid >/dev/null
+			unset "proccomm[$pid] proccmdline[$pid]"	# we no longer need to keep track of this PID
+			changed=1
+		fi
+	done
+	((changed)) && get_controlled_pids	# update the array -- probably cheaper to do it in one go than to throw out elements one by one
+}
+
+function get_traffic() {	# outputs the average bytes per second of network traffic to or from the cgroup over the last 2s
+	local i
+	local trafbytes
+	sudo --non-interactive \
+		pktstat-bpf -c $child_cgroup_path -t 2s 2>/dev/null \
+		| awk '
+			{
+				for(i=1; i<=NF; i++) if ($i == "bytes:") { 
+					gsub(/[^0-9]/, "", $(i+1)); total += $(i+1)
+				}
+			} END { print total }' \
+		| read trafbytes
+	echo $[trafbytes/2]
+}
+
+function lost_focus() {	# called if our child cgroup just lost focus
+	log debug "Child cgroup lost focus. In focus now: ${focused_procname}[$focused_pid]; previously: ${prev_focused_procname}[$prev_focused_pid]. Sleeping until next focus change, or for $SUSPENDAFTER seconds."
+	[[ $last_in_focus -lt $EPOCHSECONDS ]] && last_in_focus=$EPOCHSECONDS	# but it had just been in focus until this point, so record that (we were triggered by the focus change event, so one of our special children really did have focus until a moment ago)
+	in_focus=0
+	# if our child loses focus, we won't suspend it for at least SUSPENDAFTER more seconds, so we can sleep until then, except if there is a focus change and it gains focus again. RESUMEEVERY/RESUMEFOR is irrelevant because the child cgroup is not frozen.
+	delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]	# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
+	next_event="suspend due to lack of input focus, subject to traffic threshold"
+	[[ -n "$NICE_BG" ]] && $renice_cmd $NICE_BG $(<$child_cgroup_path/cgroup.procs) >/dev/null
+	return 0
+}
+
+typeset -g last_configcheck=0
+function read_config() { # TODO: perhaps source a config _file_ instead of reading files from a config _dir_?
+	[[ $last_configcheck = $EPOCHSECONDS ]] && return 0	# reread configuration at most once per second
+	if [[ -d "$CONFDIR" ]]; then	# Override configuration at runtime by polling configfiles. TODO: use mapfile? TODO: check mtime? (worth it?)
+		last_configcheck=$EPOCHSECONDS
+		[[ -f $CONFDIR/debug ]]			&& DEBUG=$(<$CONFDIR/debug)
+		[[ -f $CONFDIR/gracetime ]]		&& GRACETIME=$(<$CONFDIR/gracetime)
+		[[ -f $CONFDIR/loglevel ]]		&& LOG_LEVEL=$(<$CONFDIR/loglevel)
+		[[ -f $CONFDIR/loopdelay ]]		&& loopdelay=$(<$CONFDIR/loopdelay)
+		[[ -f $CONFDIR/nice_bg ]]		&& NICE_BG_user=$(<$CONFDIR/nice_bg)
+		[[ -f $CONFDIR/nice_fg ]]		&& NICE_FG_user=$(<$CONFDIR/nice_fg)
+		[[ -f $CONFDIR/procname ]]		&& PROCNAME=$(<$CONFDIR/procname)
+		[[ -f $CONFDIR/resumefor ]]		&& RESUMEFOR=$(<$CONFDIR/resumefor)
+		[[ -f $CONFDIR/resumeevery ]]		&& RESUMEEVERY=$(<$CONFDIR/resumeevery)
+		[[ -f $CONFDIR/suspendafter ]]		&& SUSPENDAFTER=$(<$CONFDIR/suspendafter)
+		[[ -f $CONFDIR/trafficthreshold ]]	&& TRAFFICTHRESHOLD=$(<$CONFDIR/trafficthreshold)
+		[[ -f $CONFDIR/verbose ]]		&& VERBOSE=$(<$CONFDIR/verbose)
+	fi
+	((VERBOSE)) && LOG_LEVEL=info
+	set +xv
+	((DEBUG))   && LOG_LEVEL=debug && set -xv
+	GRACETIME=${GRACETIME:-0}
+	# Without sudo, there is a limit to how far we can raise niceness.
+	# We could have complex logic to determine whether an adjustment would be an increase or decrease, and arrive at specific lower-than-current nice values that are not 19,
+	# but I don't think it's worth it -- just make sure to either use sudo, or, better, to have an appropriate RLIMIT_NICE (20 is a good value as it'll allow renicing up to 0).
+	[[ -n "$NICE_BG_user" ]] && ! ((SUDO_NICE)) && NICE_BG=$((min($NICE_BG_user,20-$(ulimit -e))))	
+	[[ -n "$NICE_FG_user" ]] && ! ((SUDO_NICE)) && NICE_FG=$((min($NICE_FG_user,20-$(ulimit -e))))
+	renice_cmd=(renice)
+	((SUDO_NICE)) && renice_cmd=(sudo --non-interactive renice)
+	# Don't use sudo if it appears we won't need it (as the requested and effectively possible nice values are equal)
+	[[ "$NICE_BG_user" = "$NICE_BG" ]] && [[ "$NICE_FG_user" = "$NICE_FG" ]] && renice_cmd=(renice)
+	PERIODIC_RESUME=0; [[ "$RESUMEEVERY" -gt 0 ]] && [[ "$RESUMEFOR" -gt 0 ]] && PERIODIC_RESUME=1	# a boolean flag to simplify checks for whether periodic resume is enabled
+}
+
+DEBUG=0
+VERBOSE=0
+SUDO_NICE=0
+LOG_LEVEL=warning
+PROCNAME=.	# the regular expression process names must match or be evicted from our control group
+loopdelay=1000	# _minimum_ delay between checks for config changes, in 1/100 seconds, even if there is no focus change. (Focus changes always trigger a config re-read, subject to a 1/s rate limit.)
+		# Can be overridden via CONFDIR/loopdelay.
+		# Lower loopdelay means higher CPU usage, but faster reaction to config changes.
+		# I expect RESUMEEVERY/RESUMEFOR to be just a ballpark figure most of the time, with a difference of +-5 seconds to be irrelevant.
+		# The script will also try to calculate the time to the next scheduled event (see below), and sleep only until then, or the next focus change; so if RESUMEEVERY or RESUMEFOR is low, it'll sleep less and still be pretty accurate.
+		# loopdelay only really affects accuracy if you lower RESUMEEVERY in the config dir.
+LOG_LEVEL_NAMES=(emerg alert crit err warning notice info debug)
+LOG_LEVEL=${LOG_LEVEL:-err}
+typeset -g me=${0:t}		# used by log()
+typeset -g last_in_focus=0	# the last time a process from our cgroup had focus
+typeset -g focused_pid=0
+typeset -g focused_procname=""
+typeset -g child_cgroup_path=	# will contain the full path to the cgroup we're managing
+typeset -g my_cgroup_path=""	# will contain the full path to the cgroup this process runs in
+typeset -a systemd_run_args=()	# if any -p/--property arguments are mixed in with our own, we'll accumulate them in this array
+typeset -g -A logged_time	# when each message was last logged; used for crude rate limiting
+typeset -g -A class		# hash of window IDs (we only re-invoke xprop to obtain this once every ~100 loops)
+typeset -g -A win_to_pid	# hash mapping window IDs to process IDs
+typeset -g -A proccomm		# hash mapping process IDs to commands (/proc/PID/comm)
+typeset -g -A proccmdline	# hash mapping process IDs to command lines (/proc/PID/cmdline)
+typeset -g -U controlled_pids	# the set of PIDs in our child cgroup
+typeset -g frozen_at=0		# when we last froze the child cgroup. Needed for RESUMEEVERY/RESUMEFOR.
+typeset -g thawed_at=0		# when we last unfroze the child cgroup for RESUMEEVERY/RESUMEFOR purposes.
+typeset -g delta_t=0		# time until the next scheduled operation
+				# * if our child _loses_ focus, we won't suspend it for at least SUSPENDAFTER more seconds, so we can sleep until then, except if there is a focus change and it gains focus again. RESUMEEVERY/RESUMEFOR is irrelevant because the child cgroup is not frozen.
+				# * if we suspended the child cgroup, the soonest we have to do anything is in RESUMEEVERY seconds, or on focus change
+				# * if we thawed the child due to RESUMEEVERY, we can sleep for RESUMEFOR seconds but need to keep track of focus changes
+typeset -g next_event		# set to a textual representation of the next scheduled event; only used for logging
+typeset -g in_focus=0		# whether one of "our" processes has focus. Used to track when we _lose_ focus.
+typeset -g focus_changed=1	# whether we need to repopulate focused_pid, focused_procname, prev_focused_pid and prev_focused_procname
+
+while [[ -n "$1" ]]; do	# TODO: support --switch=value
+	case "$1" in
+		--cgroup)		shift; child_cgroup_path=$1;;
+		--confdir)		shift; CONFDIR=$1;;
+		--debug)		DEBUG=1; LOG_LEVEL=debug;;
+		--gracetime)		shift; GRACETIME=$1;;
+		--help)			usage; exit 0;;
+		--suspendafter)		shift; SUSPENDAFTER=$1;;
+		--trafficthreshold)	shift; TRAFFICTHRESHOLD=$1;;
+		--unit)			shift; UNITNAME=$1;;
+		--verbose)		VERBOSE=1; ((DEBUG)) || LOG_LEVEL=info;;
+		--logfile)		shift; LOGFILE=$1;;
+		--loglevel)		shift; { ((VERBOSE)) || ((DEBUG)) } || LOG_LEVEL=$1;;
+		--nice_bg)		shift; NICE_BG_user=$1;;
+		--nice_fg)		shift; NICE_FG_user=$1;;
+		--procname)		shift; PROCNAME="$1";;
+		--resumefor)		shift; RESUMEFOR=$1;;
+		--resumeevery)		shift; RESUMEEVERY=$1;;
+		--sudo_nice)		SUDO_NICE=1;;
+		-p|--property)		systemd_run_args=($systemd_run_args $1 $2); shift;;
+		--)			shift; break;;
+		*)			break;;
+	esac
+	shift
+done
+read_config
+
+# $@ only contains args for systemd-run or its child now
+
+if [[ -n "$child_cgroup_path" ]]; then
+	if [[ -d "$child_cgroup_path" ]]; then
+		[[ -z "$UNITNAME" ]] && UNITNAME="${child_cgroup_path:t:r}"			
+		log info "Managing pre-existing cgroup ${(qq)child_cgroup_path}, using ${(qq)UNITNAME} as the unit name."
+	else
+		if [[ -n "$@" ]]; then
+			log err "The specified --cgroup ${(qq)child_cgroup_path} doesn't seem to be a directory. Ignoring and starting our own."
+			start_child $@	# start child in the background
+		else
+			log emerg "The specified --cgroup ${(qq)child_cgroup_path} doesn't seem to be a directory, and no command to run specified. Aborting."
+		fi
+	fi
+else
+	start_child $@	# start child in the background
+	last_in_focus=$[EPOCHSECONDS+GRACETIME]	# if we're just starting, avoid freezing for GRACETIME seconds by setting last_in_focus to a time in the future
+fi
+
+if [[ -z "$child_cgroup_path" ]]; then
+	log emerg "Unable to start '$@' via 'systemd-run' (child_cgroup_path empty). Aborting."
+	exit 111
+fi
+
+setopt TRAPS_ASYNC
+trap 'exit' 15
+trap 'exit' 1
+
+log notice "child_cgroup_path: $child_cgroup_path -- you can pass this in with --cgroup if you re-execute the script."
+my_cgroup_path=$(get_cgroup_path $$)
+log debug "my_cgroup_path=$my_cgroup_path"
+
+# main loop
+coproc xprop -spy -root _NET_ACTIVE_WINDOW	# start xprop as a coprocess; this way we get notified of focus changes immediately and don't have to keep spawning new instances of xprop
+
+while [[ -d $child_cgroup_path ]]; do
+	read_config
+	
+	if ! [[ $delta_t = 0 ]]; then
+		read_timeout=$(( min(max(delta_t,0),loopdelay/100.0) ))	# make sure the result is nonnegative; if delta_t is very large, cap the wait to loopdelay
+		read_timeout_str=$(printf "%.1f" "$read_timeout")
+		log debug "Waiting for focus change, or $read_timeout_str seconds, whichever occurs first. Next scheduled event ($next_event) is ${delta_t}s from now."
+	else
+		read_timeout=$((loopdelay/100.0))		# just fall back to this default if there was no specific event to anticipate
+	fi
+	delta_t=0						# we set it to zero after use for other code to know it hasn't been set to anything yet in this loop run
+	next_event="none"
+	if read -t $read_timeout -p window; then		# if the read succeeds, a new window has focus; if not, there is no focus change, but we may need to suspend the child if it has been in the background for long enough
+		focus_changed=1
+		window=${window#*# }    # xprop output is like '_NET_ACTIVE_WINDOW(WINDOW): window id # 0x5000017' -- get just the ID itself
+	else
+		focus_changed=0		# the read timed out; no focus change, but we may need to update last_in_focus or perform a background thaw/freeze for RESUMEEVERY/RESUMEFOR
+	fi
+	((focus_changed)) && get_active_window_data  # Sets focused_pid and focused_procname. Could do this each time even if no focus change because the process name may have changed; but eventual consistency should be fine (we'll get the new process name the next time this window receives focus).
+
+	get_controlled_pids
+#	remove_nonmatching_pids	# Also updates global $controlled_pids; but we don't want to call this every time the loop runs, because it's relatively expensive, so we'll only call it before sending the cgroup to sleep
+	if [[ $#controlled_pids = 0 ]]; then
+		log notice "Controlled cgroup contains no processes; exiting"
+		exit 0
+	fi
+	
+	# If one of our processes is in focus, we can skip all other processing (like resumeevery/resumefor).
+	if [[ ${controlled_pids[(ie)$focused_pid]} -le $#controlled_pids ]]; then		# Does the window in focus belong to a process in the child cgroup?
+		if match_pid_procname $focused_pid; then					# If yes: is it a process that belongs there?
+			((in_focus)) || [[ -n "$NICE_FG" ]] && $renice_cmd $NICE_FG $(<$child_cgroup_path/cgroup.procs)	>/dev/null # just gained focus; renice to FG level
+			in_focus=1								# yes to both: great, a relevant process from our child cgroup has focus
+			[[ $last_in_focus -lt $EPOCHSECONDS ]] && last_in_focus=$EPOCHSECONDS	# keep the added GRACETIME, if any
+			thawed_at=0	# we have actual focus; this isn't a background resume, so reset the timestamps related to RESUMEEVERY/RESUMEFOR
+			frozen_at=0
+			if [[ $(<$child_cgroup_path/cgroup.freeze) = 1 ]]; then
+				log info "In focus: $focused_procname. In our cgroup and matches procname regexp. Resuming."
+				echo 0 >$child_cgroup_path/cgroup.freeze
+			else
+				log debug "In focus: $focused_procname. In our cgroup and matches procname regexp. cgroup not frozen; sleeping."
+				
+			fi
+			delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]			# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
+			next_event="earliest opportunity to suspend due to lack of input focus"
+			continue
+		else										# The process that has focus is in our cgroup, but doesn't belong there based on its name
+			log debug "In focus: $focused_procname. In our cgroup, but doesn't match procname regex. Evicting from cgroup."
+			remove_nonmatching_pids	# what has focus is a process we should remove from our cgroup, because it didn't match PROCNAME; it will get unsuspended as a result, and the cgroup can stay frozen. Since we know there is at least one nonmatching process in the cgroup, we might as well check all.
+			((in_focus)) && lost_focus && continue					# If we had focus so far, there can't be anything else to do yet; we'll need to wait for SUSPENDAFTER seconds
+		fi
+	else											# A process outside our cgroup has focus
+		((in_focus)) && lost_focus && continue						# If we had focus so far, there can't be anything else to do yet; we'll need to wait for SUSPENDAFTER seconds
+	fi
+
+	# This is only reached if:
+	# 1. what is currently in focus is not a member of our cgroup, AND
+	# 2. our cgroup didn't just lose focus.
+	#
+	# When we're here, our cgroup can be unfrozen,
+	#	either because it has had focus within the last SUSPENDAFTER seconds (so: check whether SUSPENDAFTER has elapsed), OR
+	#	because it has been resumed due to RESUMEEVERY (so: check whether RESUMEFOR has elapsed).
+	# OR it can be frozen at the moment, in which case we need to check whether to thaw it for RESUMEEVERY.
+	
+	if [[ $(<$child_cgroup_path/cgroup.freeze) = 0 ]]; then			# currently unfrozen?
+
+		# Check whether we had focus recently enough:
+		if [[ $[EPOCHSECONDS-last_in_focus] -le $SUSPENDAFTER ]]; then	# still within SUSPENDAFTER?
+			if [[ $EPOCHSECONDS -lt $last_in_focus ]]; then		# if last_in_focus is in the future, we log a different message
+				log debug "not suspending: still within startup grace time."
+			else
+				log debug "not suspending: last_in_focus=$(strftime %H:%M:%S $last_in_focus), less than $SUSPENDAFTER seconds ago."
+			fi
+			delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]			# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
+			next_event="suspend due to lack of input focus, subject to traffic threshold"
+			continue	# skip traffic check if we're not going to suspend
+		fi
+
+		# This is reached if the cgroup is not frozen, SUSPENDAFTER has expired, but we RESUMEFOR might not have; so check that.
+
+		if ((thawed_at)); then	# background resume in progress
+			if ((PERIODIC_RESUME)); then	# is periodic unfreezing still configured? (If not, we need to freeze the cgroup immediately, modulo traffic check.)
+				if [[ $[EPOCHSECONDS-thawed_at] -le $RESUMEFOR ]]; then
+					log debug "cgroup in background resumed state; resumed at $(strftime %H:%M:%S $thawed_at), for $RESUMEFOR seconds."
+					delta_t=$[thawed_at+RESUMEFOR-EPOCHSECONDS]
+					next_event="re-freeze after periodic resume"
+					continue
+				else
+					log debug "cgroup in background resumed state; resumed at $(strftime %H:%M:%S $thawed_at), more than $RESUMEFOR seconds ago. Will suspend subject to TRAFFICTHRESHOLD."
+				fi
+			else
+				log info "cgroup in background resumed state, but periodic resuming disabled via config (RESUMEEVERY=$RESUMEEVERY; RESUMEFOR=$RESUMEFOR). Will suspend subject to TRAFFICTHRESHOLD."
+			fi
+		fi
+		
+		# At this point, we believe the cgroup must be suspended, except if its traffic is over the threshold.
+		traffic=0
+		if [[ "$TRAFFICTHRESHOLD" -gt 0 ]]; then
+			traffic=$(get_traffic)
+			if [[ $traffic -ge $TRAFFICTHRESHOLD ]]; then
+				log debug "cgroup network activity is $traffic Bps (over $TRAFFICTHRESHOLD Bps). Not suspending."
+				delta_t=2	# we'll re-check traffic frequently to be able to suspend aggressively
+				next_event="re-check traffic volume"
+				continue
+			else
+				log info "freezing child cgroup. last_in_focus=$(strftime %H:%M:%S $last_in_focus). Network activity is $traffic Bps, less than $TRAFFICTHRESHOLD Bps."
+			fi
+		else
+			log info "freezing child cgroup. last_in_focus=$(strftime %H:%M:%S $last_in_focus). TRAFFICTHRESHOLD is not set."
+		fi
+		remove_nonmatching_pids
+		echo 1 >$child_cgroup_path/cgroup.freeze
+		frozen_at=$EPOCHSECONDS	
+		thawed_at=0
+		if [[ $RESUMEEVERY -gt 0 ]]; then # we just froze the cgroup; we may need to unfreeze RESUMEEVERY seconds from now (if configured), or on focus change
+			next_event="periodic resume"
+			delta_t=$RESUMEEVERY
+		else
+			delta_t=0
+		fi
+		continue
+
+	else	# Currently frozen (and not in focus, or we would have unfrozen it above).
+		
+		if ((PERIODIC_RESUME)); then		# is periodic unfreezing (still) configured?
+			if [[ $[EPOCHSECONDS-frozen_at] -ge $RESUMEEVERY ]]; then
+				log info "cgroup frozen since $(strftime %H:%M:%S $fozen_at), more than $RESUMEEVERY seconds ago; giving it a chance to run for $RESUMEFOR seconds."
+				echo 0 >$child_cgroup_path/cgroup.freeze
+				thawed_at=$EPOCHSECONDS
+				frozen_at=0
+				delta_t=$RESUMEFOR
+				continue
+			else
+				: # frozen and no need to resume; don't even log this
+			fi
+		fi
+	fi
+	delta_t=0	# If this was reached, there is no specific future event we can anticipate
+done
+log notice "Controlled cgroup disappeared; exiting."
+exit 0
