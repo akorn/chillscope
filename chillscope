@@ -6,15 +6,15 @@
 # * The scope is thawed if one of its member processes receives the input focus.
 # * For the first GRACETIME seconds, the scope is left running.
 # * The scope is frozen if it hasn't had the input focus for more than SUSPENDAFTER seconds (if SUSPENDAFTER is set).
-#   * The scope is not frozen while it has at least TRAFFICTHRESHOLD bytes/second of incoming or outgoing traffic in total, if TRAFFICTHRESHOLD is set. This requires the ability to run `sudo pktstat-bpf`, and relies on parsing that tool's output, so it could be fragile.
+#   * The scope is not frozen while it has at least TRAFFICTHRESHOLD bytes/second of incoming or outgoing traffic in total, if TRAFFICTHRESHOLD is set. This requires the ability to run `sudo --non-interactive pktstat-bpf`, and relies on parsing that tool's output, so it could be fragile.
 #     * Traffic sampling time is currently hard-coded to be 2s..
 # * The scope is thawed for RESUMEFOR seconds every RESUMEEVERY seconds, if both are set.
 #   * If TRAFFICTHRESHOLD is set, it's checked before re-freezing.
 # * Before freezing the scope, the script enumerates the processes that are in it, and moves any whose name doesn't match PROCNAME (a regex) from the child scope to the script's own cgroup (TODO: perhaps support moving to a different cgroup).
-# * The script will exit if the controlled scope becomes empty.
+# * The script will exit if the controlled scope becomes empty or disappears.
 # * In addition to freezing the cgroup, the script can also nice and un-nice the cgroup members when the cgroup loses or gains focus (NICE_BG, NICE_FG). Increasing niceness is only possible up to "20-$(ulimit -e nice)", the "max nice" rlimit (see getrlimit(2)).
 #   * Note: without configuration in /etc/security/limits*, rlimit_nice will generally be 0, which means the lowest attainable nice value is 20. Setting either --nice_bg or --nice_fg in this situation without --sudo_nice will effectively set the nice value to 19, always.
-#   * If --sudo_nice is passed on the command line, the script will use `sudo renice` instead of `renice`.
+#   * If --sudo_nice is passed on the command line, the script will use `sudo --non-interactive renice` instead of `renice`.
 #
 # The parameters can be set and changed at runtime as follows:
 #
@@ -202,6 +202,14 @@ function get_cgroup_path() {
 	echo /sys/fs/cgroup/${cgroup_path#0::}	# this is where we depend on cgroupv2; in v1, /proc/self/cgroup may contain multiple lines
 }
 
+function evict_process() {
+	local pid=$1
+	log notice "Process $pid, called $proccomm[$pid] (cmdline ${(qq)proccmdline[$pid]}) doesn't match regex ${(qq)PROCNAME}; moving to $my_cgroup_path"
+	echo $pid >$my_cgroup_path/cgroup.procs
+	[[ -n "$NICE_FG" ]] && $renice_cmd $NICE_FG $pid >/dev/null
+	unset "proccomm[$pid] proccmdline[$pid]"	# we no longer need to keep track of this PID
+}
+
 function remove_nonmatching_pids() {
 	local pid
 	local changed=0
@@ -209,10 +217,7 @@ function remove_nonmatching_pids() {
 	get_controlled_pids
 	for pid in $controlled_pids; do
 		if ! match_pid_procname $pid; then	
-			log notice "Process $pid, called $proccomm[$pid] (cmdline ${(qq)proccmdline[$pid]}) doesn't match regex ${(qq)PROCNAME}; moving to $my_cgroup_path"
-			echo $pid >$my_cgroup_path/cgroup.procs
-			[[ -n "$NICE_FG" ]] && $renice_cmd $NICE_FG $pid >/dev/null
-			unset "proccomm[$pid] proccmdline[$pid]"	# we no longer need to keep track of this PID
+			evict_process $pid
 			changed=1
 		fi
 	done
@@ -235,13 +240,27 @@ function get_traffic() {	# outputs the average bytes per second of network traff
 }
 
 function lost_focus() {	# called if our child cgroup just lost focus
-	log debug "Child cgroup lost focus. In focus now: ${focused_procname}[$focused_pid]; previously: ${prev_focused_procname}[$prev_focused_pid]. Sleeping until next focus change, or for $SUSPENDAFTER seconds."
 	[[ $last_in_focus -lt $EPOCHSECONDS ]] && last_in_focus=$EPOCHSECONDS	# but it had just been in focus until this point, so record that (we were triggered by the focus change event, so one of our special children really did have focus until a moment ago)
 	in_focus=0
+	if [[ $(<$child_cgroup_path/cgroup.freeze) = 1 ]]; then # "4a branch" -- see below, in main loop, for what that means
+		log err "Our cgroup just lost focus, and is currently frozen. This shouldn't be possible, unless some external mechanism froze it."
+		if [[ $SUSPENDAFTER -lt 0 ]]; then		# "4a/5a branch" -- ditto
+			log notice "SUSPENDAFTER is negative, so no freezing should occur; yet the cgroup is frozen. Unfreezing."
+			echo 0 >$child_cgroup_path/cgroup.freeze
+		fi
+	fi
 	# if our child loses focus, we won't suspend it for at least SUSPENDAFTER more seconds, so we can sleep until then, except if there is a focus change and it gains focus again. RESUMEEVERY/RESUMEFOR is irrelevant because the child cgroup is not frozen.
-	delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]	# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
-	next_event="suspend due to lack of input focus, subject to traffic threshold"
-	[[ -n "$NICE_BG" ]] && $renice_cmd $NICE_BG $(<$child_cgroup_path/cgroup.procs) >/dev/null
+	if [[ $SUSPENDAFTER -ge 0 ]]; then
+		delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]			# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
+		next_event="earliest opportunity to suspend due to lack of input focus"
+	fi
+	if [[ -n "$NICE_BG" ]]; then
+		log debug "Child cgroup lost focus. In focus now: ${focused_procname}[$focused_pid]; previously: ${prev_focused_procname}[$prev_focused_pid]. Renicing to $NICE_BG."
+		remove_nonmatching_pids	# before renicing, we need to throw out non-matching processes
+		$renice_cmd $NICE_BG $(<$child_cgroup_path/cgroup.procs) >/dev/null
+	else
+		log debug "Child cgroup lost focus. In focus now: ${focused_procname}[$focused_pid]; previously: ${prev_focused_procname}[$prev_focused_pid]."
+	fi
 	return 0
 }
 
@@ -283,6 +302,7 @@ DEBUG=0
 VERBOSE=0
 SUDO_NICE=0
 LOG_LEVEL=warning
+SUSPENDAFTER=-1	# unless this is set to a nonnegative value, we won't actually suspend the cgroup due to inactivity (but it could still be reniced)
 PROCNAME=.	# the regular expression process names must match or be evicted from our control group
 loopdelay=1000	# _minimum_ delay between checks for config changes, in 1/100 seconds, even if there is no focus change. (Focus changes always trigger a config re-read, subject to a 1/s rate limit.)
 		# Can be overridden via CONFDIR/loopdelay.
@@ -404,31 +424,92 @@ while [[ -d $child_cgroup_path ]]; do
 		exit 0
 	fi
 	
-	# If one of our processes is in focus, we can skip all other processing (like resumeevery/resumefor).
-	if [[ ${controlled_pids[(ie)$focused_pid]} -le $#controlled_pids ]]; then		# Does the window in focus belong to a process in the child cgroup?
-		if match_pid_procname $focused_pid; then					# If yes: is it a process that belongs there?
-			((in_focus)) || [[ -n "$NICE_FG" ]] && $renice_cmd $NICE_FG $(<$child_cgroup_path/cgroup.procs)	>/dev/null # just gained focus; renice to FG level
-			in_focus=1								# yes to both: great, a relevant process from our child cgroup has focus
-			[[ $last_in_focus -lt $EPOCHSECONDS ]] && last_in_focus=$EPOCHSECONDS	# keep the added GRACETIME, if any
+	# Check
+	# 1. whether a child cgroup member has focus (a. yes; b. no);
+	# 2. whether its name/cmdline matches PROCNAME (a. yes; b. no);
+	# 3. whether we just gained or lost focus (4 cases: a. just gained focus; b. already in focus; c. just lost focus; d. not in focus previously, nor now);
+	# 4. whether the cgroup is frozen (a. yes; b. no);
+	# 5. whether SUSPENDAFTER is "< 0", "== 0" or "> 0" (3 cases: a. <0; b. ==0; c. >0)
+	#
+	# The following cases are possible:
+	#
+	# 1a. cgroup member has focus
+	#	2a. its name matches PROCNAME (in all subcases, 5. almost irrelevant, just matters for delta_t and next_event)
+	#		3a. we just gained focus (in_focus==0) => renice to NICE_FG, in_focus:=1
+	#			4a. group is suspended => unfreeze
+	#			4b. group is running => nothing to do
+	#		3b. we didn't just gain focus (in_focus==1) => nothing to do
+	#			4a. group is suspended -- impossible
+	#			4b. group is running => nothing to do
+	#		3c., 3d. -- impossible (only possible when we don't have focus)
+	#	2b. its name doesn't match PROCNAME => remove from cgroup (renice not needed as it wasn't niced to NICE_BG -- TODO: set custom nice value on eviction?)
+	#		3a., 3b. we just gained focus, or didn't just gain it but have it -- impossible (we do not have focus!)
+	#		3c. we just lost focus => renice to NICE_BG, in_focus:=0 -- call lost_focus(), which will do all of this, we just "continue" or not:
+	#			4a. group is suspended -- theoretically impossible (it can't have been suspended while it was in focus)
+	#				5a. SUSPENDAFTER < 0 => unfreeze, continue
+	#				5b., 5c. => nothing to do
+	#			4b. group is running
+	#				5a. SUSPENDAFTER < 0, so no suspend on idle => call lost_focus(), restart loop (continue keyword -- handled later)
+	#				5b. SUSPENDAFTER = 0, immediately suspend on idle, modulo TRAFFICTHRESHOLD => continue processing (no "continue" keyword);
+	#				5c. SUSPENDAFTER > 0, suspend some time after idle => call lost_focus(), restart loop (continue keyword) -- not important, but saves a few cpu cycles
+	#		3d. we didn't have focus (not before, not now)
+	#			4a. or 4b. (irrelevant)
+	#				5a. SUSPENDAFTER < 0, so no suspend on idle => restart loop (continue keyword -- handled later)
+	#				5b. SUSPENDAFTER = 0, immediately suspend on idle, modulo TRAFFICTHRESHOLD => continue processing (no "continue" keyword);
+	#				5c. SUSPENDAFTER > 0, suspend some time after idle => continue processing
+	# 1b. non-cgroup-member has focus
+	#	2a. or 2b. (irrelevant)
+	#		3a. and 3b. -- impossible, we don't have focus
+	#		3c. just lost focus => renice to NICE_BG, in_focus:=0 -- call lost_focus(), which will do all of this:
+	#			4a. group is suspended -- theoretically impossible (it can't have been suspended while it was in focus)
+	#				5a. SUSPENDAFTER < 0 => unfreeze, continue (restart loop)
+	#				5b., 5c. => nothing to do, but continue processing
+	#			4b. group is running
+	#				5a. SUSPENDAFTER < 0, so no suspend on idle => call lost_focus(), restart loop (continue keyword -- handled later)
+	#				5b. SUSPENDAFTER = 0, immediately suspend on idle, modulo TRAFFICTHRESHOLD => continue processing (no "continue" keyword);
+	#				5c. SUSPENDAFTER > 0, suspend some time after idle => call lost_focus(), restart loop (continue keyword) -- not important, but saves a few cpu cycles
+	#		3d. we didn't have focus (not before, not now)
+	#			4a. group is suspended
+	#				5a. SUSPENDAFTER < 0 => unfreeze, continue (restart loop -- handled later)
+	#				5b., 5c. => nothing to do, but continue processing
+	#			4b. group is running
+	#				5a. SUSPENDAFTER < 0, so no suspend on idle => restart loop (continue keyword -- handled later)
+	#				5b. SUSPENDAFTER = 0, immediately suspend on idle, modulo TRAFFICTHRESHOLD => continue processing (no "continue" keyword);
+	#				5c. SUSPENDAFTER > 0, suspend some time after idle => continue processing (no "continue" keyword);
+	#
+	# At this point, if in_focus==1, a relevant process was in focus so far
+	if [[ ${controlled_pids[(ie)$focused_pid]} -le $#controlled_pids ]]; then		# Does the window in focus belong to a process in the child cgroup? (1a branch)
+		if match_pid_procname $focused_pid; then					# If yes: is it a process that belongs there? (1a/2a branch)
+			if ! ((in_focus)); then							# Did we just gain focus? (1a/2a/3a branch)
+				if [[ -n "$NICE_FG" ]]; then
+					log debug "A cgroup member with name matching PROCNAME regex just gained focus ($focused_procname). Renicing to $NICE_FG."
+					$renice_cmd $NICE_FG $(<$child_cgroup_path/cgroup.procs)	>/dev/null # just gained focus; renice to FG level
+				fi
+				if [[ $(<$child_cgroup_path/cgroup.freeze) = 1 ]]; then		# Is the group frozen? (1a/2a/3a/4a branch)
+					log info "Gained focus: $focused_procname. In our cgroup and matches procname regexp. Resuming."
+					echo 0 >$child_cgroup_path/cgroup.freeze
+				else								# (1a/2a/3a/4b branch)
+					log debug "In focus: $focused_procname. In our cgroup and matches procname regexp. cgroup not frozen; sleeping."
+				fi
+			else
+				: # 1a/2a/3b branch; nothing special to do
+			fi
+			in_focus=1								# record that we have focus on this loop -- needed for focus gained/focus lost logic
+			[[ $last_in_focus -lt $EPOCHSECONDS ]] && last_in_focus=$EPOCHSECONDS	# keep the added GRACETIME, if any; we keep tracking last_in_focus even if SUSPENDAFTER < 0 because the config can change
 			thawed_at=0	# we have actual focus; this isn't a background resume, so reset the timestamps related to RESUMEEVERY/RESUMEFOR
 			frozen_at=0
-			if [[ $(<$child_cgroup_path/cgroup.freeze) = 1 ]]; then
-				log info "In focus: $focused_procname. In our cgroup and matches procname regexp. Resuming."
-				echo 0 >$child_cgroup_path/cgroup.freeze
-			else
-				log debug "In focus: $focused_procname. In our cgroup and matches procname regexp. cgroup not frozen; sleeping."
-				
-			fi
-			delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]			# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky)
-			next_event="earliest opportunity to suspend due to lack of input focus"
+			[[ $SUSPENDAFTER -lt 0 ]] && continue
+			delta_t=$[last_in_focus+SUSPENDAFTER-EPOCHSECONDS]			# last_in_focus can be in the future due to GRACETIME; or it could be exactly equal to EPOCHSECONDS (+-1 second, if you're feeling nitpicky). If it _is_ in the future, we want to include the remaining grace time in delta_t.
+			next_event="earliest opportunity to suspend due to lack of input focus and SUSPENDAFTER >=0"
 			continue
-		else										# The process that has focus is in our cgroup, but doesn't belong there based on its name
+		else							# The process that has focus is in our cgroup, but doesn't belong there based on its name (1a/2b branch)
 			log debug "In focus: $focused_procname. In our cgroup, but doesn't match procname regex. Evicting from cgroup."
-			remove_nonmatching_pids	# what has focus is a process we should remove from our cgroup, because it didn't match PROCNAME; it will get unsuspended as a result, and the cgroup can stay frozen. Since we know there is at least one nonmatching process in the cgroup, we might as well check all.
-			((in_focus)) && lost_focus && continue					# If we had focus so far, there can't be anything else to do yet; we'll need to wait for SUSPENDAFTER seconds
+			evict_process $focused_pid	# lost_focus() will call remove_nonmatching_pids() before renicing to NICE_BG, but only if NICE_BG is set; I'm not sure it's worth complicating the logic to make sure we only call remove_nonmatching_pids, and exactly once
+			get_controlled_pids		# if we know which one we removed, and controlled_pids were a hash, not an array, we could just unset this key. TODO: worth it?
+			((in_focus)) && lost_focus && continue		# Did we just lose focus? (1a/2b/3c branch)
 		fi
-	else											# A process outside our cgroup has focus
-		((in_focus)) && lost_focus && continue						# If we had focus so far, there can't be anything else to do yet; we'll need to wait for SUSPENDAFTER seconds
+	else								# A process outside our cgroup has focus (1b branch)
+		((in_focus)) && lost_focus && continue			# If we had focus so far, there can't be anything else to do yet; we'll need to wait for SUSPENDAFTER seconds
 	fi
 
 	# This is only reached if:
@@ -441,6 +522,8 @@ while [[ -d $child_cgroup_path ]]; do
 	# OR it can be frozen at the moment, in which case we need to check whether to thaw it for RESUMEEVERY.
 	
 	if [[ $(<$child_cgroup_path/cgroup.freeze) = 0 ]]; then			# currently unfrozen?
+
+		[[ $SUSPENDAFTER -lt 0 ]] && continue				# if we're not configured to freeze the cgroup due to inactivity, AND it's not currently frozen, there is nothing left to do here; restart the loop
 
 		# Check whether we had focus recently enough:
 		if [[ $[EPOCHSECONDS-last_in_focus] -le $SUSPENDAFTER ]]; then	# still within SUSPENDAFTER?
@@ -499,6 +582,14 @@ while [[ -d $child_cgroup_path ]]; do
 		continue
 
 	else	# Currently frozen (and not in focus, or we would have unfrozen it above).
+		
+		if [[ $SUSPENDAFTER -lt 0 ]]; then				# if we're not configured to freeze the cgroup due to inactivity, AND it's currently frozen, unfreeze it immediately and restart the loop
+			log notice "cgroup frozen, but SUSPENDAFTER < 0 ($SUSPENDAFTER); unfreezing."
+			echo 1 >$child_cgroup_path/cgroup.freeze
+			forzen_at=0
+			thawed_at=0
+			continue
+		fi
 		
 		if ((PERIODIC_RESUME)); then		# is periodic unfreezing (still) configured?
 			if [[ $[EPOCHSECONDS-frozen_at] -ge $RESUMEEVERY ]]; then
