@@ -378,8 +378,8 @@ if [[ -n "$child_cgroup_path" ]]; then
 	fi
 else
 	start_child $@	# start child in the background
-	last_in_focus=$[EPOCHSECONDS+GRACETIME]	# if we're just starting, avoid freezing for GRACETIME seconds by setting last_in_focus to a time in the future
 fi
+last_in_focus=$[EPOCHSECONDS+GRACETIME]	# avoid freezing for GRACETIME seconds by setting last_in_focus to a time in the future
 
 if [[ -z "$child_cgroup_path" ]]; then
 	log emerg "Unable to start '$@' via 'systemd-run' (child_cgroup_path empty). Aborting."
