@@ -148,6 +148,7 @@ function get_active_window_data() {     # obtains class, pid and command associa
 	focused_pid=$(get_window_pid)
 	match_pid_procname $focused_pid	# populates proccomm and proccmdline
 	focused_procname="${proccomm[$focused_pid]}[$focused_pid] (cmdline ${(qq)proccmdline[$focused_pid]})"
+	log debug "get_active_window_data: $focused_procname"
 }
 
 function get_window_pid() {
@@ -189,7 +190,7 @@ function match_pid_procname() {    # returns true if EITHER /proc/$1/comm OR /pr
 	fi
 	[[ -n "$proccomm[$1]" ]] || return 0 # avoid side effects of race conditions where /proc/$1/comm is empty when we read it (maybe the process was just exiting, or is just being spawned -- either way, we don't want to evict it from our cgroup)
 	[[ $proccomm[$1] =~ $PROCNAME ]] && return 0
-	[[ $proccmdline[$1] =~ $PROCNAME ]] && return 0
+	[[ ${proccmdline[$1]//$NUL/ } =~ $PROCNAME ]] && return 0	# NUL characters confuse the regex match, so remove them
 	return 1
 }
 
@@ -199,7 +200,22 @@ function get_controlled_pids() {
 
 function get_cgroup_path() {
 	local cgroup_path=$(</proc/$1/cgroup)
-	echo /sys/fs/cgroup/${cgroup_path#0::}	# this is where we depend on cgroupv2; in v1, /proc/self/cgroup may contain multiple lines
+	cgroup_path=${cgroup_path#0::}	# this is where we depend on cgroupv2; in v1, /proc/self/cgroup may contain multiple lines, but we assume it'll be one, and we can just append to /sys/fs/cgroup
+	local i
+	local final_cgroup_path=/sys/fs/cgroup
+	# ...except that systemd likes to replace slashes with "\x2f" in the last path component, so handle that:
+	echo ${cgroup_path//\//\\n} | while read -r i; do
+		[[ -z "$i" ]] && continue	# strip double slashes, which end up being empty lines
+		if [[ -d $final_cgroup_path/$i ]]; then
+			final_cgroup_path=$final_cgroup_path/$i
+		else
+			final_cgroup_path=$final_cgroup_path/$i
+			while read -r i; do
+				final_cgroup_path="${final_cgroup_path}\\\x2f$i"
+			done
+		fi
+	done
+	echo "$final_cgroup_path"
 }
 
 function evict_process() {
@@ -334,6 +350,7 @@ typeset -g delta_t=0		# time until the next scheduled operation
 typeset -g next_event		# set to a textual representation of the next scheduled event; only used for logging
 typeset -g in_focus=0		# whether one of "our" processes has focus. Used to track when we _lose_ focus.
 typeset -g focus_changed=1	# whether we need to repopulate focused_pid, focused_procname, prev_focused_pid and prev_focused_procname
+NUL=$(printf '\000')
 
 while [[ -n "$1" ]]; do	# TODO: support --switch=value
 	case "$1" in
