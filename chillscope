@@ -194,6 +194,45 @@ function match_pid_procname() {    # returns true if EITHER /proc/$1/comm OR /pr
 	return 1
 }
 
+function catch_children() {	# enumerates the children of the monitored cgroup and moves them into the cgroup if their name matches PROCNAME
+	local parent child changed=0 catch_all=0
+	local -a queue
+
+	[[ $1 = all ]] && catch_all=1
+
+	if [[ $LOG_LEVEL = debug ]] || [[ $LOG_LEVEL = info ]]; then
+		local -a before=($controlled_pids)
+	fi
+	queue=($controlled_pids)	# iterate over current members
+
+	while (( ${#queue[@]} )); do
+		parent=$queue[1]
+		queue[1]=()
+
+		for child in $(pgrep -P $parent 2>/dev/null); do
+			[[ -n "$child" ]] || continue
+			((${controlled_pids[(ie)$child]} <= $#controlled_pids)) && continue	# already in cgroup
+
+			if ((catch_all)) || match_pid_procname "$child"; then
+				echo "$child" > "$child_cgroup_path/cgroup.procs"
+				changed=1
+				queue+=($child)	# add this child to the queue (but not children of processes with non-matching names)
+			fi
+		done
+	done
+	if ((changed)); then
+		get_controlled_pids	# re-read cgroup membership because we changed it
+		if [[ $LOG_LEVEL = debug ]] || [[ $LOG_LEVEL = info ]]; then
+			local -a after=($controlled_pids)
+			local -U added=(${after:|before})
+			if [[ $#added -gt 0 ]]; then
+				log info "catch_children: caught the following PIDs and added them to the cgroup: $added"
+			fi
+		fi
+	fi
+}
+
+
 function get_controlled_pids() {
 	controlled_pids=($(<$child_cgroup_path/cgroup.procs)) || controlled_pids=()
 }
@@ -371,7 +410,7 @@ while [[ -n "$1" ]]; do	# TODO: support --switch=value
 		--resumefor)		shift; RESUMEFOR=$1;;
 		--resumeevery)		shift; RESUMEEVERY=$1;;
 		--sudo_nice)		SUDO_NICE=1;;
-		-p|--property)		systemd_run_args=($systemd_run_args $1 $2); shift;;
+		-p|--property)		systemd_run_args+=($1 $2); shift;;
 		--)			shift; break;;
 		*)			break;;
 	esac
@@ -385,6 +424,8 @@ if [[ -n "$child_cgroup_path" ]]; then
 	if [[ -d "$child_cgroup_path" ]]; then
 		[[ -z "$UNITNAME" ]] && UNITNAME="${child_cgroup_path:t:r}"			
 		log info "Managing pre-existing cgroup ${(qq)child_cgroup_path}, using ${(qq)UNITNAME} as the unit name."
+		get_controlled_pids
+		catch_children all	# we'll evict non-matching processes later
 	else
 		if [[ -n "$@" ]]; then
 			log err "The specified --cgroup ${(qq)child_cgroup_path} doesn't seem to be a directory. Ignoring and starting our own."
